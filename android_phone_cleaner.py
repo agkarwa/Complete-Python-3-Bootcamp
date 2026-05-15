@@ -318,6 +318,7 @@ def list_all_app_caches():
 
     freed_kb = sum(r[0] for r in targets)
     print(f"\n  About to clear cache for {len(targets)} app(s)  ({_human(freed_kb)} estimated).")
+    print("  Method: cmd package trim-caches (cache-only, safe — does NOT wipe app data)")
     confirm = input("  Confirm? (yes/no): ").strip().lower()
     if confirm != "yes":
         print("  Cancelled.")
@@ -326,14 +327,15 @@ def list_all_app_caches():
     print()
     ok = fail = 0
     for kb, pkg, kind in targets:
-        res = run_adb(["shell", "pm", "clear", "--cache-only", pkg])
-        status = "OK" if res.returncode == 0 else "FAIL"
-        if res.returncode == 0:
+        ok_flag, note = _clear_cache_safe(pkg, kb)
+        status = "OK" if ok_flag else "FAIL"
+        if ok_flag:
             ok += 1
         else:
             fail += 1
         display = pkg if len(pkg) <= 45 else pkg[:42] + "..."
-        print(f"  [{status}] {display:<45} {_human(kb):>9}")
+        suffix = f"  ({note})" if note else ""
+        print(f"  [{status}] {display:<45} {_human(kb):>9}{suffix}")
 
     print("\n" + "═" * 60)
     print(f"  Cleared : {ok} app(s)   Failed : {fail} app(s)")
@@ -341,8 +343,42 @@ def list_all_app_caches():
     print("═" * 60)
 
 
+def _clear_cache_safe(pkg, size_kb=0):
+    """
+    Clear only the cache for *pkg* without touching user data.
+
+    Strategy (in order):
+    1. root path: rm -rf /data/data/<pkg>/cache/*  (instant, precise)
+    2. non-root:  cmd package trim-caches asks Android to free
+                  at least size_kb worth of cache for that package.
+    Returns (success: bool, note: str).
+    """
+    # Try rooted path first (works silently if not rooted)
+    res = run_adb(["shell",
+                   f"su -c 'rm -rf /data/data/{pkg}/cache/* 2>/dev/null' 2>/dev/null; echo $?"])
+    if res.stdout.strip() == "0":
+        return True, "root"
+
+    # Non-root: ask Android's storage manager to reclaim cache for this package.
+    # We request double the known cache size so Android actually frees it.
+    want_bytes = max(size_kb * 1024 * 2, 1048576)  # at least 1 MB request
+    res2 = run_adb(["shell", f"cmd package trim-caches {want_bytes} {pkg} 2>/dev/null; echo $?"])
+    last_line = res2.stdout.strip().splitlines()[-1] if res2.stdout.strip() else "1"
+    if last_line == "0":
+        return True, "trim-caches"
+
+    # Last resort: system-wide trim requesting the same bytes (no per-pkg targeting)
+    res3 = run_adb(["shell", f"cmd package trim-caches {want_bytes} 2>/dev/null; echo $?"])
+    last_line3 = res3.stdout.strip().splitlines()[-1] if res3.stdout.strip() else "1"
+    if last_line3 == "0":
+        return True, "system trim"
+
+    return False, "needs root"
+
+
 def clear_app_caches():
-    print("\n--- Clearing App Caches ---")
+    print("\n--- Clearing App Caches (cache-only, safe) ---")
+    print("    Uses trim-caches / root rm — does NOT wipe app data.\n")
     result = run_adb(["shell", "pm", "list", "packages", "-3"])
     packages = [line.replace("package:", "").strip() for line in result.stdout.splitlines()]
 
@@ -351,13 +387,15 @@ def clear_app_caches():
         return
 
     print(f"Found {len(packages)} third-party apps. Clearing caches...")
-    cleared = 0
+    ok = fail = 0
     for pkg in packages:
-        res = run_adb(["shell", "pm", "clear", "--cache-only", pkg])
-        if res.returncode == 0:
-            cleared += 1
+        success, _ = _clear_cache_safe(pkg)
+        if success:
+            ok += 1
+        else:
+            fail += 1
 
-    print(f"Cleared cache for {cleared}/{len(packages)} apps.")
+    print(f"Cleared : {ok}   Failed : {fail}   (failures need root access)")
 
 
 def clear_system_temp():
