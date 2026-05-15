@@ -176,13 +176,39 @@ def get_storage_info():
     print("═" * 52)
 
 
+def _is_rooted():
+    """Return True if the device has an accessible su binary."""
+    res = run_adb(["shell", "su -c 'echo ok' 2>/dev/null"])
+    return res.stdout.strip() == "ok"
+
+
+def _total_cache_kb_from_diskstats():
+    """
+    Read aggregate cache size from dumpsys diskstats — works without root.
+    Returns total cache KB, or 0 if unavailable.
+    """
+    res = run_adb(["shell", "dumpsys diskstats"])
+    for line in res.stdout.splitlines():
+        # Line format: "App Cache: 512345 KB"  or "Cache-Free: 512345"
+        lower = line.lower()
+        if "cache" in lower and "kb" in lower:
+            parts = line.split()
+            for p in parts:
+                if p.isdigit():
+                    return int(p)
+    return 0
+
+
 def list_all_app_caches():
     print("\n" + "═" * 60)
     print("  APP CACHE LIST")
     print("═" * 60)
-    print("  Fetching all installed packages...")
 
-    # Get all packages: system (-s) and third-party (-3)
+    rooted = _is_rooted()
+    print(f"  Root access : {'YES — per-app sizes and targeted clean available' if rooted else 'NO  — sizes via diskstats only; clean is system-wide'}")
+
+    # ── Package list ─────────────────────────────────────────
+    print("  Fetching installed packages...")
     res_sys = run_adb(["shell", "pm", "list", "packages", "-s"])
     res_3p  = run_adb(["shell", "pm", "list", "packages", "-3"])
 
@@ -200,37 +226,29 @@ def list_all_app_caches():
         print("  No packages found.")
         return
 
-    # Collect cache sizes via du on /data/data/<pkg>/cache
-    print(f"  Scanning cache for {len(all_pkgs)} apps (this may take a moment)...")
-    cache_root = "/data/data"
-
-    # Bulk du in one shell call for speed
-    res = run_adb(["shell", f"du -sk {cache_root}/*/cache 2>/dev/null"])
+    # ── Cache sizes ──────────────────────────────────────────
     size_map = {}
-    for line in res.stdout.strip().splitlines():
-        parts = line.split(None, 1)
-        if len(parts) == 2:
-            try:
-                kb = int(parts[0])
-            except ValueError:
-                continue
-            pkg = parts[1].replace(f"{cache_root}/", "").replace("/cache", "").strip()
-            size_map[pkg] = kb
 
-    # Also check /data/user/0/<pkg>/cache (multi-user path on newer Android)
-    res2 = run_adb(["shell", f"du -sk /data/user/0/*/cache 2>/dev/null"])
-    for line in res2.stdout.strip().splitlines():
-        parts = line.split(None, 1)
-        if len(parts) == 2:
-            try:
-                kb = int(parts[0])
-            except ValueError:
-                continue
-            pkg = parts[1].replace("/data/user/0/", "").replace("/cache", "").strip()
-            if pkg not in size_map or size_map[pkg] == 0:
-                size_map[pkg] = kb
+    if rooted:
+        # Root: du gives exact per-app cache sizes
+        print(f"  Scanning cache for {len(all_pkgs)} apps via root du...")
+        for path_prefix in ["/data/data", "/data/user/0"]:
+            res = run_adb(["shell", f"su -c 'du -sk {path_prefix}/*/cache 2>/dev/null'"])
+            for line in res.stdout.strip().splitlines():
+                parts = line.split(None, 1)
+                if len(parts) == 2:
+                    try:
+                        kb = int(parts[0])
+                    except ValueError:
+                        continue
+                    pkg = parts[1].replace(f"{path_prefix}/", "").replace("/cache", "").strip()
+                    if pkg not in size_map or size_map[pkg] == 0:
+                        size_map[pkg] = kb
+    else:
+        # No root: du on /data/data is blocked. Get total from diskstats only.
+        print("  No root — per-app sizes unavailable. Reading total from dumpsys diskstats...")
 
-    # Build rows: every known package, defaulting missing ones to 0
+    # ── Build rows ───────────────────────────────────────────
     rows = []
     for pkg in all_pkgs:
         kb = size_map.get(pkg, 0)
@@ -240,61 +258,90 @@ def list_all_app_caches():
     rows.sort(key=lambda r: r[0], reverse=True)
 
     total_cache_kb = sum(r[0] for r in rows)
-    nonzero        = [r for r in rows if r[0] > 0]
-    zero           = [r for r in rows if r[0] == 0]
+    if not rooted:
+        total_cache_kb = _total_cache_kb_from_diskstats()
 
-    # ── Filter prompt ────────────────────────────────────────
-    print("\n  Filter:  [1] All apps   [2] Third-party only   [3] Non-zero only")
-    filt = input("  Choice (default 1): ").strip() or "1"
-    if filt == "2":
-        rows = [r for r in rows if r[2] == "3rd-party"]
-    elif filt == "3":
-        rows = nonzero
+    nonzero = [r for r in rows if r[0] > 0]
+
+    # ── Filter (only meaningful with root) ───────────────────
+    if rooted and nonzero:
+        print("\n  Filter:  [1] All apps   [2] Third-party only   [3] Non-zero only")
+        filt = input("  Choice (default 3): ").strip() or "3"
+        if filt == "2":
+            rows = [r for r in rows if r[2] == "3rd-party"]
+        elif filt == "3":
+            rows = nonzero
+    else:
+        # Without root all sizes are 0 — show package list without size column
+        rows = sorted(rows, key=lambda r: (r[2] != "3rd-party", r[1]))
 
     # ── Table ────────────────────────────────────────────────
     print()
-    print(f"  {'#':>4}  {'Package':<45} {'Type':<10} {'Cache':>9}")
-    print("  " + "-" * 72)
-
-    for i, (kb, pkg, kind) in enumerate(rows, 1):
-        size_str = _human(kb) if kb > 0 else "  —"
-        # Truncate long package names
-        display = pkg if len(pkg) <= 45 else pkg[:42] + "..."
-        print(f"  {i:>4}  {display:<45} {kind:<10} {size_str:>9}")
+    if rooted:
+        print(f"  {'#':>4}  {'Package':<45} {'Type':<10} {'Cache':>9}")
+        print("  " + "-" * 72)
+        for i, (kb, pkg, kind) in enumerate(rows, 1):
+            size_str = _human(kb) if kb > 0 else "  —"
+            display = pkg if len(pkg) <= 45 else pkg[:42] + "..."
+            print(f"  {i:>4}  {display:<45} {kind:<10} {size_str:>9}")
+    else:
+        print(f"  {'#':>4}  {'Package':<50} {'Type':<10}")
+        print("  " + "-" * 67)
+        for i, (kb, pkg, kind) in enumerate(rows, 1):
+            display = pkg if len(pkg) <= 50 else pkg[:47] + "..."
+            print(f"  {i:>4}  {display:<50} {kind:<10}")
 
     # ── Summary ──────────────────────────────────────────────
-    shown_nonzero = [r for r in rows if r[0] > 0]
-    print("  " + "-" * 72)
-    print(f"\n  Total apps scanned : {len(all_pkgs)}")
-    print(f"  Apps with cache    : {len(nonzero)}")
-    print(f"  Apps with no cache : {len(zero)}")
-    print(f"  Total cache size   : {_human(total_cache_kb)}")
-
-    if not nonzero:
-        print("\n  Note: 0-byte results may mean ADB lacks permission to read")
-        print("  /data/data. Try enabling 'USB Debugging (Security Settings)'")
-        print("  or run ADB as root: adb root")
-        print("═" * 60)
-        return
-
+    print("  " + "-" * (72 if rooted else 67))
+    print(f"\n  Total apps : {len(all_pkgs)}  "
+          f"({len(third_pkgs)} third-party, {len(system_pkgs)} system)")
+    print(f"  Total cache: {_human(total_cache_kb)}"
+          + ("  (from diskstats — system total)" if not rooted else ""))
     print("═" * 60)
 
     # ── Clean prompt ─────────────────────────────────────────
-    if not shown_nonzero:
-        return
-
     print("\n  Clean options:")
-    print("  [A] Clean ALL shown caches")
-    print("  [S] Select specific apps by number  (e.g. 1,3,5 or 1-4)")
-    print("  [N] Do nothing (return to menu)")
+    if rooted:
+        print("  [A] Clean ALL shown caches        (root rm — precise, per-app)")
+        print("  [S] Select specific apps by number (e.g. 1,3,5-7)")
+    else:
+        print("  [A] Clean ALL app caches")
+        print("      (system-wide trim-caches — Android frees cache for all apps)")
+        print("      Per-app selection is NOT possible without root.")
+    print("  [N] Do nothing")
     action = input("\n  Choice: ").strip().upper()
 
-    if action == "N" or action == "":
+    if action not in ("A", "S"):
         return
 
+    if not rooted:
+        # Non-root path: one system-wide trim-caches call
+        if action != "A":
+            print("  Per-app selection requires root. Run: adb root")
+            return
+        before_kb = total_cache_kb
+        confirm = input(f"\n  Clear all caches (~{_human(before_kb)})? (yes/no): ").strip().lower()
+        if confirm != "yes":
+            print("  Cancelled.")
+            return
+        # Request Android to free all known cache (pass a very large number so
+        # it drains as much cache as possible, not just a small slice).
+        want_bytes = max(before_kb * 1024 * 2, 512 * 1024 * 1024)  # at least 512 MB
+        res = run_adb(["shell", f"cmd package trim-caches {want_bytes}"])
+        after_kb = _total_cache_kb_from_diskstats()
+        freed_kb = max(before_kb - after_kb, 0)
+        print(f"\n  trim-caches sent to Android.")
+        print(f"  Cache before : {_human(before_kb)}")
+        print(f"  Cache after  : {_human(after_kb)}")
+        print(f"  Freed        : {_human(freed_kb)}")
+        print("\n  Note: Android controls how much it actually frees. Apps that are")
+        print("  actively running may retain some cache until they're closed.")
+        return
+
+    # Rooted path: per-app rm
     targets = []
     if action == "A":
-        targets = shown_nonzero
+        targets = [r for r in rows if r[0] > 0]
     elif action == "S":
         raw = input("  Enter numbers (e.g. 1,3,5-7): ").strip()
         selected = set()
@@ -310,16 +357,11 @@ def list_all_app_caches():
                 selected.add(int(part))
         targets = [rows[i - 1] for i in sorted(selected) if 1 <= i <= len(rows) and rows[i - 1][0] > 0]
         if not targets:
-            print("  No valid entries selected.")
+            print("  No valid entries with cache selected.")
             return
-    else:
-        print("  Invalid choice.")
-        return
 
     freed_kb = sum(r[0] for r in targets)
-    print(f"\n  About to clear cache for {len(targets)} app(s)  ({_human(freed_kb)} estimated).")
-    print("  Method: cmd package trim-caches (cache-only, safe — does NOT wipe app data)")
-    confirm = input("  Confirm? (yes/no): ").strip().lower()
+    confirm = input(f"\n  Clear cache for {len(targets)} app(s) (~{_human(freed_kb)})? (yes/no): ").strip().lower()
     if confirm != "yes":
         print("  Cancelled.")
         return
@@ -327,75 +369,53 @@ def list_all_app_caches():
     print()
     ok = fail = 0
     for kb, pkg, kind in targets:
-        ok_flag, note = _clear_cache_safe(pkg, kb)
-        status = "OK" if ok_flag else "FAIL"
-        if ok_flag:
-            ok += 1
-        else:
-            fail += 1
-        display = pkg if len(pkg) <= 45 else pkg[:42] + "..."
-        suffix = f"  ({note})" if note else ""
-        print(f"  [{status}] {display:<45} {_human(kb):>9}{suffix}")
-
-    print("\n" + "═" * 60)
-    print(f"  Cleared : {ok} app(s)   Failed : {fail} app(s)")
-    print(f"  Space freed (estimated) : {_human(freed_kb)}")
-    print("═" * 60)
-
-
-def _clear_cache_safe(pkg, size_kb=0):
-    """
-    Clear only the cache for *pkg* without touching user data.
-
-    Strategy (in order):
-    1. root path: rm -rf /data/data/<pkg>/cache/*  (instant, precise)
-    2. non-root:  cmd package trim-caches asks Android to free
-                  at least size_kb worth of cache for that package.
-    Returns (success: bool, note: str).
-    """
-    # Try rooted path first (works silently if not rooted)
-    res = run_adb(["shell",
-                   f"su -c 'rm -rf /data/data/{pkg}/cache/* 2>/dev/null' 2>/dev/null; echo $?"])
-    if res.stdout.strip() == "0":
-        return True, "root"
-
-    # Non-root: ask Android's storage manager to reclaim cache for this package.
-    # We request double the known cache size so Android actually frees it.
-    want_bytes = max(size_kb * 1024 * 2, 1048576)  # at least 1 MB request
-    res2 = run_adb(["shell", f"cmd package trim-caches {want_bytes} {pkg} 2>/dev/null; echo $?"])
-    last_line = res2.stdout.strip().splitlines()[-1] if res2.stdout.strip() else "1"
-    if last_line == "0":
-        return True, "trim-caches"
-
-    # Last resort: system-wide trim requesting the same bytes (no per-pkg targeting)
-    res3 = run_adb(["shell", f"cmd package trim-caches {want_bytes} 2>/dev/null; echo $?"])
-    last_line3 = res3.stdout.strip().splitlines()[-1] if res3.stdout.strip() else "1"
-    if last_line3 == "0":
-        return True, "system trim"
-
-    return False, "needs root"
-
-
-def clear_app_caches():
-    print("\n--- Clearing App Caches (cache-only, safe) ---")
-    print("    Uses trim-caches / root rm — does NOT wipe app data.\n")
-    result = run_adb(["shell", "pm", "list", "packages", "-3"])
-    packages = [line.replace("package:", "").strip() for line in result.stdout.splitlines()]
-
-    if not packages:
-        print("No third-party apps found.")
-        return
-
-    print(f"Found {len(packages)} third-party apps. Clearing caches...")
-    ok = fail = 0
-    for pkg in packages:
-        success, _ = _clear_cache_safe(pkg)
+        res = run_adb(["shell", f"su -c 'rm -rf /data/data/{pkg}/cache/* /data/user/0/{pkg}/cache/* 2>/dev/null'; echo $?"])
+        success = res.stdout.strip().splitlines()[-1] == "0" if res.stdout.strip() else False
+        status = "OK" if success else "FAIL"
         if success:
             ok += 1
         else:
             fail += 1
+        display = pkg if len(pkg) <= 45 else pkg[:42] + "..."
+        print(f"  [{status}] {display:<45} {_human(kb):>9}")
 
-    print(f"Cleared : {ok}   Failed : {fail}   (failures need root access)")
+    print("\n" + "═" * 60)
+    print(f"  Cleared : {ok}   Failed : {fail}")
+    print(f"  Space freed (estimated) : {_human(freed_kb)}")
+    print("═" * 60)
+
+
+def clear_app_caches():
+    print("\n--- Clearing App Caches ---")
+    rooted = _is_rooted()
+    print(f"    Root: {'YES — per-app rm' if rooted else 'NO  — system-wide trim-caches'}\n")
+
+    before_kb = _total_cache_kb_from_diskstats()
+
+    if rooted:
+        result = run_adb(["shell", "pm", "list", "packages"])
+        packages = [l.replace("package:", "").strip() for l in result.stdout.splitlines() if l.startswith("package:")]
+        print(f"Clearing cache for {len(packages)} apps via root...")
+        ok = fail = 0
+        for pkg in packages:
+            res = run_adb(["shell", f"su -c 'rm -rf /data/data/{pkg}/cache/* /data/user/0/{pkg}/cache/* 2>/dev/null'; echo $?"])
+            if res.stdout.strip().splitlines()[-1] == "0":
+                ok += 1
+            else:
+                fail += 1
+        print(f"Done — cleared: {ok}  failed: {fail}")
+    else:
+        # Non-root: one system-wide trim-caches draining as much as possible
+        want_bytes = max(before_kb * 1024 * 2, 512 * 1024 * 1024)
+        print(f"Sending trim-caches to Android (requesting {_human(want_bytes // 1024)} freed)...")
+        run_adb(["shell", f"cmd package trim-caches {want_bytes}"])
+        print("Done.")
+
+    after_kb = _total_cache_kb_from_diskstats()
+    freed_kb = max(before_kb - after_kb, 0)
+    print(f"\nCache before : {_human(before_kb)}")
+    print(f"Cache after  : {_human(after_kb)}")
+    print(f"Freed        : {_human(freed_kb)}")
 
 
 def clear_system_temp():
