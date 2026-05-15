@@ -15,6 +15,61 @@ def run_adb(args, capture=True):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Storage helpers
+# ---------------------------------------------------------------------------
+
+def _parse_df_line(line):
+    """Return (used_kb, total_kb) from a `df` output line, or (0, 0)."""
+    parts = line.split()
+    # Typical format: Filesystem  1K-blocks  Used  Available  Use%  Mounted
+    try:
+        total_kb = int(parts[1])
+        used_kb  = int(parts[2])
+        return used_kb, total_kb
+    except (IndexError, ValueError):
+        return 0, 0
+
+
+def _usage_bar(used, total, width=30):
+    """Return an ASCII progress bar and percentage string."""
+    pct = used / total if total else 0
+    filled = int(pct * width)
+    bar = "█" * filled + "░" * (width - filled)
+    return f"[{bar}] {pct*100:5.1f}%"
+
+
+def _human(kb):
+    """Convert kilobytes to a human-readable string."""
+    if kb >= 1_048_576:
+        return f"{kb / 1_048_576:.2f} GB"
+    if kb >= 1_024:
+        return f"{kb / 1_024:.2f} MB"
+    return f"{kb} KB"
+
+
+def _folder_size_kb(path):
+    """Return total size of a folder in KB via `du`, or 0 on error."""
+    res = run_adb(["shell", f"du -sk {path} 2>/dev/null"])
+    line = res.stdout.strip().splitlines()
+    if line:
+        try:
+            return int(line[0].split()[0])
+        except (IndexError, ValueError):
+            pass
+    return 0
+
+
+def _count_files(path, extensions):
+    """Count files under *path* matching any of *extensions* (e.g. '*.jpg')."""
+    patterns = " -o ".join(f"-name '{e}'" for e in extensions)
+    res = run_adb(["shell", f"find {path} \\( {patterns} \\) -type f 2>/dev/null | wc -l"])
+    try:
+        return int(res.stdout.strip())
+    except ValueError:
+        return 0
+
+
 def check_device():
     result = run_adb(["devices"])
     lines = result.stdout.strip().splitlines()
@@ -29,9 +84,96 @@ def check_device():
 
 
 def get_storage_info():
-    result = run_adb(["shell", "df", "/data"])
-    print("\n--- Storage Usage ---")
-    print(result.stdout)
+    print("\n" + "═" * 52)
+    print("  STORAGE REPORT")
+    print("═" * 52)
+
+    # ── 1. Partition overview ────────────────────────────────
+    print("\n  Partitions")
+    print("  " + "-" * 49)
+    partitions = {
+        "Internal (/data)":    "/data",
+        "SD Card  (/sdcard)":  "/sdcard",
+        "System   (/system)":  "/system",
+    }
+    totals_used = totals_total = 0
+    for label, mount in partitions.items():
+        res = run_adb(["shell", "df", "-k", mount])
+        lines = [l for l in res.stdout.strip().splitlines() if mount in l or (len(res.stdout.strip().splitlines()) == 2)]
+        if not lines:
+            print(f"  {label:<22} — not available")
+            continue
+        used_kb, total_kb = _parse_df_line(lines[-1])
+        if total_kb == 0:
+            print(f"  {label:<22} — not available")
+            continue
+        bar = _usage_bar(used_kb, total_kb, width=24)
+        free_kb = total_kb - used_kb
+        print(f"  {label:<22} {bar}")
+        print(f"  {'':22} Used {_human(used_kb):>9}  Free {_human(free_kb):>9}  Total {_human(total_kb):>9}")
+        if mount != "/system":
+            totals_used  += used_kb
+            totals_total += total_kb
+
+    # ── 2. Category breakdown (sdcard) ──────────────────────
+    print("\n  Media Categories  (/sdcard)")
+    print("  " + "-" * 49)
+    categories = [
+        ("Photos / Screenshots", ["*.jpg", "*.jpeg", "*.png", "*.webp", "*.heic"],
+         ["/sdcard/DCIM", "/sdcard/Pictures", "/sdcard/Screenshots"]),
+        ("Videos",               ["*.mp4", "*.mkv", "*.avi", "*.mov", "*.3gp"],
+         ["/sdcard/DCIM", "/sdcard/Movies"]),
+        ("Music / Audio",        ["*.mp3", "*.flac", "*.aac", "*.ogg", "*.wav"],
+         ["/sdcard/Music"]),
+        ("Documents",            ["*.pdf", "*.docx", "*.xlsx", "*.pptx", "*.txt"],
+         ["/sdcard/Documents", "/sdcard/Download"]),
+        ("APK files",            ["*.apk"],
+         ["/sdcard"]),
+    ]
+    for name, exts, paths in categories:
+        total_files = sum(_count_files(p, exts) for p in paths)
+        folder_kb   = sum(_folder_size_kb(p) for p in paths)
+        print(f"  {name:<28} {total_files:>5} files   {_human(folder_kb):>9}")
+
+    # ── 3. App cache sizes ───────────────────────────────────
+    print("\n  App Cache Sizes  (top 8)")
+    print("  " + "-" * 49)
+    cache_root = "/data/data"
+    res = run_adb(["shell", f"du -sk {cache_root}/*/cache 2>/dev/null | sort -rn | head -8"])
+    cache_lines = res.stdout.strip().splitlines()
+    if cache_lines:
+        for cl in cache_lines:
+            parts = cl.split()
+            if len(parts) >= 2:
+                size_kb = int(parts[0]) if parts[0].isdigit() else 0
+                # path like /data/data/com.example.app/cache -> extract package
+                pkg = parts[1].replace(f"{cache_root}/", "").replace("/cache", "")
+                print(f"  {pkg:<40} {_human(size_kb):>9}")
+    else:
+        print("  (requires root or elevated ADB access)")
+
+    # ── 4. Key folders ───────────────────────────────────────
+    print("\n  Key Folder Sizes")
+    print("  " + "-" * 49)
+    folders = [
+        ("Downloads",    "/sdcard/Download"),
+        ("WhatsApp",     "/sdcard/WhatsApp"),
+        ("Telegram",     "/sdcard/Telegram"),
+        ("DCIM",         "/sdcard/DCIM"),
+        ("Android/data", "/sdcard/Android/data"),
+        ("Temp /tmp",    "/data/local/tmp"),
+    ]
+    for fname, fpath in folders:
+        kb = _folder_size_kb(fpath)
+        bar = _usage_bar(kb, totals_total, width=16) if totals_total else ""
+        print(f"  {fname:<20} {_human(kb):>9}   {bar}")
+
+    # ── 5. Summary ───────────────────────────────────────────
+    print("\n" + "═" * 52)
+    if totals_total:
+        print(f"  Overall (data + sdcard): {_human(totals_used)} used / {_human(totals_total)} total")
+        print(f"  Free space remaining   : {_human(totals_total - totals_used)}")
+    print("═" * 52)
 
 
 def clear_app_caches():
