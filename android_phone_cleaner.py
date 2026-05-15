@@ -263,6 +263,7 @@ def list_all_app_caches():
         print(f"  {i:>4}  {display:<45} {kind:<10} {size_str:>9}")
 
     # ── Summary ──────────────────────────────────────────────
+    shown_nonzero = [r for r in rows if r[0] > 0]
     print("  " + "-" * 72)
     print(f"\n  Total apps scanned : {len(all_pkgs)}")
     print(f"  Apps with cache    : {len(nonzero)}")
@@ -273,7 +274,70 @@ def list_all_app_caches():
         print("\n  Note: 0-byte results may mean ADB lacks permission to read")
         print("  /data/data. Try enabling 'USB Debugging (Security Settings)'")
         print("  or run ADB as root: adb root")
+        print("═" * 60)
+        return
 
+    print("═" * 60)
+
+    # ── Clean prompt ─────────────────────────────────────────
+    if not shown_nonzero:
+        return
+
+    print("\n  Clean options:")
+    print("  [A] Clean ALL shown caches")
+    print("  [S] Select specific apps by number  (e.g. 1,3,5 or 1-4)")
+    print("  [N] Do nothing (return to menu)")
+    action = input("\n  Choice: ").strip().upper()
+
+    if action == "N" or action == "":
+        return
+
+    targets = []
+    if action == "A":
+        targets = shown_nonzero
+    elif action == "S":
+        raw = input("  Enter numbers (e.g. 1,3,5-7): ").strip()
+        selected = set()
+        for part in raw.split(","):
+            part = part.strip()
+            if "-" in part:
+                try:
+                    lo, hi = part.split("-", 1)
+                    selected.update(range(int(lo), int(hi) + 1))
+                except ValueError:
+                    pass
+            elif part.isdigit():
+                selected.add(int(part))
+        targets = [rows[i - 1] for i in sorted(selected) if 1 <= i <= len(rows) and rows[i - 1][0] > 0]
+        if not targets:
+            print("  No valid entries selected.")
+            return
+    else:
+        print("  Invalid choice.")
+        return
+
+    freed_kb = sum(r[0] for r in targets)
+    print(f"\n  About to clear cache for {len(targets)} app(s)  ({_human(freed_kb)} estimated).")
+    confirm = input("  Confirm? (yes/no): ").strip().lower()
+    if confirm != "yes":
+        print("  Cancelled.")
+        return
+
+    print()
+    ok = fail = 0
+    for kb, pkg, kind in targets:
+        res = run_adb(["shell", "pm", "clear", "--cache-only", pkg])
+        status = "OK" if res.returncode == 0 else "FAIL"
+        if res.returncode == 0:
+            ok += 1
+        else:
+            fail += 1
+        display = pkg if len(pkg) <= 45 else pkg[:42] + "..."
+        print(f"  [{status}] {display:<45} {_human(kb):>9}")
+
+    print("\n" + "═" * 60)
+    print(f"  Cleared : {ok} app(s)   Failed : {fail} app(s)")
+    print(f"  Space freed (estimated) : {_human(freed_kb)}")
     print("═" * 60)
 
 
