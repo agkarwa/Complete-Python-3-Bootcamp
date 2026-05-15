@@ -176,6 +176,107 @@ def get_storage_info():
     print("═" * 52)
 
 
+def list_all_app_caches():
+    print("\n" + "═" * 60)
+    print("  APP CACHE LIST")
+    print("═" * 60)
+    print("  Fetching all installed packages...")
+
+    # Get all packages: system (-s) and third-party (-3)
+    res_sys = run_adb(["shell", "pm", "list", "packages", "-s"])
+    res_3p  = run_adb(["shell", "pm", "list", "packages", "-3"])
+
+    system_pkgs = {
+        line.replace("package:", "").strip()
+        for line in res_sys.stdout.splitlines() if line.startswith("package:")
+    }
+    third_pkgs = {
+        line.replace("package:", "").strip()
+        for line in res_3p.stdout.splitlines() if line.startswith("package:")
+    }
+    all_pkgs = system_pkgs | third_pkgs
+
+    if not all_pkgs:
+        print("  No packages found.")
+        return
+
+    # Collect cache sizes via du on /data/data/<pkg>/cache
+    print(f"  Scanning cache for {len(all_pkgs)} apps (this may take a moment)...")
+    cache_root = "/data/data"
+
+    # Bulk du in one shell call for speed
+    res = run_adb(["shell", f"du -sk {cache_root}/*/cache 2>/dev/null"])
+    size_map = {}
+    for line in res.stdout.strip().splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            try:
+                kb = int(parts[0])
+            except ValueError:
+                continue
+            pkg = parts[1].replace(f"{cache_root}/", "").replace("/cache", "").strip()
+            size_map[pkg] = kb
+
+    # Also check /data/user/0/<pkg>/cache (multi-user path on newer Android)
+    res2 = run_adb(["shell", f"du -sk /data/user/0/*/cache 2>/dev/null"])
+    for line in res2.stdout.strip().splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            try:
+                kb = int(parts[0])
+            except ValueError:
+                continue
+            pkg = parts[1].replace("/data/user/0/", "").replace("/cache", "").strip()
+            if pkg not in size_map or size_map[pkg] == 0:
+                size_map[pkg] = kb
+
+    # Build rows: every known package, defaulting missing ones to 0
+    rows = []
+    for pkg in all_pkgs:
+        kb = size_map.get(pkg, 0)
+        kind = "3rd-party" if pkg in third_pkgs else "system"
+        rows.append((kb, pkg, kind))
+
+    rows.sort(key=lambda r: r[0], reverse=True)
+
+    total_cache_kb = sum(r[0] for r in rows)
+    nonzero        = [r for r in rows if r[0] > 0]
+    zero           = [r for r in rows if r[0] == 0]
+
+    # ── Filter prompt ────────────────────────────────────────
+    print("\n  Filter:  [1] All apps   [2] Third-party only   [3] Non-zero only")
+    filt = input("  Choice (default 1): ").strip() or "1"
+    if filt == "2":
+        rows = [r for r in rows if r[2] == "3rd-party"]
+    elif filt == "3":
+        rows = nonzero
+
+    # ── Table ────────────────────────────────────────────────
+    print()
+    print(f"  {'#':>4}  {'Package':<45} {'Type':<10} {'Cache':>9}")
+    print("  " + "-" * 72)
+
+    for i, (kb, pkg, kind) in enumerate(rows, 1):
+        size_str = _human(kb) if kb > 0 else "  —"
+        # Truncate long package names
+        display = pkg if len(pkg) <= 45 else pkg[:42] + "..."
+        print(f"  {i:>4}  {display:<45} {kind:<10} {size_str:>9}")
+
+    # ── Summary ──────────────────────────────────────────────
+    print("  " + "-" * 72)
+    print(f"\n  Total apps scanned : {len(all_pkgs)}")
+    print(f"  Apps with cache    : {len(nonzero)}")
+    print(f"  Apps with no cache : {len(zero)}")
+    print(f"  Total cache size   : {_human(total_cache_kb)}")
+
+    if not nonzero:
+        print("\n  Note: 0-byte results may mean ADB lacks permission to read")
+        print("  /data/data. Try enabling 'USB Debugging (Security Settings)'")
+        print("  or run ADB as root: adb root")
+
+    print("═" * 60)
+
+
 def clear_app_caches():
     print("\n--- Clearing App Caches ---")
     result = run_adb(["shell", "pm", "list", "packages", "-3"])
@@ -265,15 +366,16 @@ def uninstall_app():
 
 def menu():
     options = {
-        "1": ("Show storage usage",         get_storage_info),
-        "2": ("Clear app caches",           clear_app_caches),
-        "3": ("Clear system temp files",    clear_system_temp),
-        "4": ("Clear logcat buffer",        clear_logcat),
-        "5": ("List top 10 largest files",  list_large_files),
-        "6": ("Manage Downloads folder",    clear_downloads),
-        "7": ("Uninstall a third-party app",uninstall_app),
-        "8": ("Run all safe cleanups (1-5)", None),
-        "0": ("Exit",                       None),
+        "1": ("Show storage usage",              get_storage_info),
+        "2": ("Clear app caches",                clear_app_caches),
+        "3": ("Clear system temp files",         clear_system_temp),
+        "4": ("Clear logcat buffer",             clear_logcat),
+        "5": ("List top 10 largest files",       list_large_files),
+        "6": ("Manage Downloads folder",         clear_downloads),
+        "7": ("Uninstall a third-party app",     uninstall_app),
+        "8": ("Run all safe cleanups (1-5)",     None),
+        "9": ("List cache of ALL apps",          list_all_app_caches),
+        "0": ("Exit",                            None),
     }
 
     print("\n╔══════════════════════════════════╗")
